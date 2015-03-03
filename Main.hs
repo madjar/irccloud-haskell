@@ -7,6 +7,9 @@ import Data.Aeson.Lens
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as L
 import Data.Configurator
+import Data.IORef
+import Data.List
+import qualified Data.Map as M
 import Data.Monoid
 import qualified Data.Text as T
 import Data.Text.Encoding
@@ -47,21 +50,34 @@ startClient email password =
 ircClient :: B.ByteString -> WS.Connection -> IO ()
 ircClient token conn = do putStrLn "Connected !"
                           WS.forkPingThread conn 5
-                          forever $ WS.receiveData conn >>= handleMsg token
+                          servers <- newIORef M.empty
+                          forever $ WS.receiveData conn >>= handleMsg (ClientData token servers)
+
+data ClientData = ClientData { cToken :: B.ByteString
+                             , cServerMap :: IORef (M.Map Integer T.Text)}
 
 -- | Handle one websocket mesage
-handleMsg :: B.ByteString -> B.ByteString -> IO ()
-handleMsg token msg = case msg ^. key "type" . _String of
-                       "oob_include" -> do let url = T.unpack $ msg ^. key "url" . _String
-                                               opts = defaults & header "Cookie" .~ ["session=" <> token]
-                                           r <- getWith opts $ "https://www.irccloud.com" ++ url
-                                           --L.putStrLn $ r ^. responseBody
-                                           putStrLn "Ignoring backlog"
-                       "buffer_msg" -> let user = msg ^. key "from" . _String
-                                           chan = msg ^. key "chan" . _String
-                                           content = msg ^. key "msg" . _String
-                                       in T.putStrLn $ chan <> " " <> user <> ": "<> content
-                       _ -> B.putStrLn msg
+handleMsg :: ClientData -> B.ByteString -> IO ()
+handleMsg cd msg =
+  case msg ^. key "type" . _String of
+   "oob_include" -> do let url = T.unpack $ msg ^. key "url" . _String
+                           opts = defaults & header "Cookie" .~ ["session=" <> cToken cd]
+                       r <- getWith opts $ "https://www.irccloud.com" ++ url
+                       mapM_ (handleMsg cd . L.toStrict) . L.lines  $ r ^. responseBody
+                       servers <- readIORef (cServerMap cd)
+                       T.putStrLn $ "Servers: " <> (T.intercalate ", " . M.elems) servers
+   "buffer_msg" -> let user = msg ^. key "from" . _String
+                       chan = msg ^. key "chan" . _String
+                       content = msg ^. key "msg" . _String
+                   in T.putStrLn $ chan <> " " <> user <> ": "<> content
+   "makeserver" -> do let Just cid = msg ^? key "cid" . _Integer
+                          name = msg ^. key "name" . _String
+                          hostname = msg ^. key "hostname" . _String
+                          serverName = if T.null name
+                                          then hostname
+                                          else name
+                      modifyIORef' (cServerMap cd) (M.insert cid serverName)
+   _ -> return () -- T.putStrLn $ "{{" <> msg ^. key "type" . _String <> "}} " <> decodeUtf8 msg
 
 -- | Connect to irccloud to get a session token and the websocket host and path
 getSessionInfo :: T.Text -> T.Text -> IO SessionInfo
