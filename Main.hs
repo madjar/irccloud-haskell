@@ -6,7 +6,7 @@ import Control.Monad
 import Data.Aeson.Lens
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as L
-import Data.Configurator
+import Data.Configurator as Config
 import Data.IORef
 import Data.List
 import qualified Data.Map as M
@@ -28,15 +28,31 @@ main = do args <- getArgs
           config <- load [Required $ head args]
           email <- require config "email"
           password <- require config "password"
-          startClient email password
+          servers <- Config.lookup config "servers"
+
+          serverMap <- newIORef M.empty
+          let clientdata = ClientData { cToken = ""
+                                      , cServerMap = serverMap
+                                      , cServerPredicate = serverPredicate servers}
+          startClient email password $ ircClient clientdata
+
+serverPredicate :: Maybe [T.Text] -> T.Text -> Bool
+serverPredicate Nothing _ = True
+serverPredicate (Just servers) server = server `elem` servers
+
+type IrcCloudClient = B.ByteString -> WS.Connection -> IO ()
 
 data SessionInfo = SessionInfo { sToken :: B.ByteString
                                , sHost :: String
                                , sPath :: String }
 
+data ClientData = ClientData { cToken :: B.ByteString
+                             , cServerMap :: IORef (M.Map Integer T.Text)
+                             , cServerPredicate :: T.Text -> Bool}
+
 -- | Starts an irccloud client with given login and password
-startClient :: T.Text -> T.Text -> IO ()
-startClient email password =
+startClient :: T.Text -> T.Text -> IrcCloudClient -> IO ()
+startClient email password client =
   do sessionInfo <- getSessionInfo email password
      runSSLClient (sHost sessionInfo)
                   443
@@ -44,17 +60,15 @@ startClient email password =
                   WS.defaultConnectionOptions
                   [("Cookie", "session=" <> sToken sessionInfo),
                    ("Origin", "https://www.irccloud.com")]
-                  (ircClient $ sToken sessionInfo)
+                  (client $ sToken sessionInfo)
 
 -- | The websocket client for IrcCloud
-ircClient :: B.ByteString -> WS.Connection -> IO ()
-ircClient token conn = do putStrLn "Connected !"
-                          WS.forkPingThread conn 5
-                          servers <- newIORef M.empty
-                          forever $ WS.receiveData conn >>= handleMsg (ClientData token servers)
+ircClient :: ClientData -> B.ByteString -> WS.Connection -> IO ()
+ircClient clientData token conn =
+  do putStrLn "Connected !"
+     WS.forkPingThread conn 5
+     forever $ WS.receiveData conn >>= handleMsg (clientData { cToken = token })
 
-data ClientData = ClientData { cToken :: B.ByteString
-                             , cServerMap :: IORef (M.Map Integer T.Text)}
 
 -- | Handle one websocket mesage
 handleMsg :: ClientData -> B.ByteString -> IO ()
@@ -66,10 +80,14 @@ handleMsg cd msg =
                        mapM_ (handleMsg cd . L.toStrict) . L.lines  $ r ^. responseBody
                        servers <- readIORef (cServerMap cd)
                        T.putStrLn $ "Servers: " <> (T.intercalate ", " . M.elems) servers
-   "buffer_msg" -> let user = msg ^. key "from" . _String
-                       chan = msg ^. key "chan" . _String
-                       content = msg ^. key "msg" . _String
-                   in T.putStrLn $ chan <> " " <> user <> ": "<> content
+   "buffer_msg" -> do let user = msg ^. key "from" . _String
+                          chan = msg ^. key "chan" . _String
+                          content = msg ^. key "msg" . _String
+                          Just cid = msg ^? key "cid" . _Integer
+                      serverMap <- readIORef $ cServerMap cd
+                      let Just server = M.lookup cid serverMap
+                      when ((cServerPredicate cd) server)
+                           (T.putStrLn $ chan <> " " <> user <> ": "<> content)
    "makeserver" -> do let Just cid = msg ^? key "cid" . _Integer
                           name = msg ^. key "name" . _String
                           hostname = msg ^. key "hostname" . _String
