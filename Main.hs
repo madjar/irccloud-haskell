@@ -67,17 +67,17 @@ ircClient :: ClientData -> B.ByteString -> WS.Connection -> IO ()
 ircClient clientData token conn =
   do putStrLn "Connected !"
      WS.forkPingThread conn 5
-     forever $ WS.receiveData conn >>= handleMsg (clientData { cToken = token })
+     forever $ WS.receiveData conn >>= handleMsg (clientData { cToken = token }) True
 
 
 -- | Handle one websocket mesage
-handleMsg :: ClientData -> B.ByteString -> IO ()
-handleMsg cd msg =
+handleMsg :: ClientData -> Bool -> B.ByteString -> IO ()
+handleMsg cd verbose msg =
   case msg ^. key "type" . _String of
    "oob_include" -> do let url = T.unpack $ msg ^. key "url" . _String
                            opts = defaults & header "Cookie" .~ ["session=" <> cToken cd]
                        r <- getWith opts $ "https://www.irccloud.com" ++ url
-                       mapM_ (handleMsg cd . L.toStrict) . L.lines  $ r ^. responseBody
+                       mapM_ (handleMsg cd False . L.toStrict) . L.lines  $ r ^. responseBody
                        servers <- readIORef (cServerMap cd)
                        T.putStrLn $ "Servers: " <> (T.intercalate ", " . M.elems) servers
    "buffer_msg" -> do let user = msg ^. key "from" . _String
@@ -86,7 +86,7 @@ handleMsg cd msg =
                           Just cid = msg ^? key "cid" . _Integer
                       serverMap <- readIORef $ cServerMap cd
                       let Just server = M.lookup cid serverMap
-                      when ((cServerPredicate cd) server)
+                      when (verbose && (cServerPredicate cd) server)
                            (T.putStrLn $ chan <> " " <> user <> ": "<> content)
    "makeserver" -> do let Just cid = msg ^? key "cid" . _Integer
                           name = msg ^. key "name" . _String
